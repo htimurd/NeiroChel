@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+import asyncio
 from datetime import datetime, timezone
 import requests
 from telegram import Update
@@ -158,6 +159,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def main() -> None:
+    # В Python 3.14 asyncio.get_event_loop() больше не создаёт цикл событий
+    # автоматически, если он не был явно установлен — а именно так делает
+    # внутренний код python-telegram-bot при запуске run_webhook/run_polling.
+    # Создаём и устанавливаем цикл вручную, чтобы это работало на любой
+    # версии Python, которую даст Render.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
