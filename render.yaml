@@ -1,0 +1,14 @@
+services:
+  - type: worker
+    name: kanger-ai-bot
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: HF_API_KEY
+        sync: false
+      - key: HF_MODEL
+        value: "HuggingFaceH4/zephyr-7b-beta"
