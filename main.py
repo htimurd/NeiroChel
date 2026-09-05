@@ -16,18 +16,19 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("KangerAI")
+logger = logging.getLogger("NeiroChel")
 
 # --- Настройки берутся из переменных окружения (задаются в Render, не в коде!) ---
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-HF_API_KEY = os.environ["HF_API_KEY"]
-HF_MODEL = os.environ.get("HF_MODEL", "deepseek-ai/DeepSeek-V3")
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+# Список бесплатных моделей на OpenRouter периодически меняется — перед деплоем
+# сверьтесь на https://openrouter.ai/models?fmt=free и при необходимости
+# поменяйте значение переменной OPENROUTER_MODEL в Render, без правки кода.
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3.1:free")
 
-# Роутер Hugging Face Inference Providers — OpenAI-совместимый chat/completions,
-# через него доступны DeepSeek-V3 / DeepSeek-R1 и другие современные модели.
-HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_HEADERS = {
-    "Authorization": f"Bearer {HF_API_KEY}",
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_HEADERS = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
     "Content-Type": "application/json",
 }
 
@@ -44,9 +45,9 @@ MAX_HISTORY_MESSAGES = 10
 # --- Статистика для админ-панели (в оперативной памяти, сбрасывается при рестарте сервиса) ---
 BOT_START_TIME = time.monotonic()
 stats = {
-    "total_messages": 0,          # сколько сообщений всего обработано
-    "users": {},                  # user_id -> {"username": str, "messages": int, "last_seen": datetime}
-    "hf_errors": 0,                # сколько раз Hugging Face вернул ошибку
+    "total_messages": 0,   # сколько сообщений всего обработано
+    "users": {},           # user_id -> {"username": str, "messages": int, "last_seen": datetime}
+    "ai_errors": 0,        # сколько раз модель ИИ вернула ошибку
 }
 
 
@@ -58,33 +59,33 @@ def register_message(user_id: int, username: str | None) -> None:
     user_stats["last_seen"] = datetime.now(timezone.utc)
 
 
-def query_huggingface(chat_id: int, user_message: str) -> str:
+def query_ai(chat_id: int, user_message: str) -> str:
     history = chat_history.get(chat_id, [])
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": user_message}]
 
     payload = {
-        "model": HF_MODEL,
+        "model": OPENROUTER_MODEL,
         "messages": messages,
         "max_tokens": 700,
         "temperature": 0.7,
     }
     try:
-        response = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload, timeout=90)
+        response = requests.post(OPENROUTER_API_URL, headers=OPENROUTER_HEADERS, json=payload, timeout=90)
         response.raise_for_status()
         data = response.json()
         choice = data["choices"][0]["message"]["content"]
         return choice.strip()
     except requests.exceptions.HTTPError as exc:
-        logger.exception("HF API HTTP error: %s | %s", exc, exc.response.text if exc.response else "")
-        stats["hf_errors"] += 1
-        return "Модель сейчас недоступна или превышен лимит. Попробуйте позже."
+        logger.exception("OpenRouter HTTP error: %s | %s", exc, exc.response.text if exc.response else "")
+        stats["ai_errors"] += 1
+        return "Модель сейчас недоступна или превышен бесплатный лимит запросов. Попробуйте через минуту."
     except requests.exceptions.RequestException as exc:
-        logger.exception("Ошибка запроса к Hugging Face: %s", exc)
-        stats["hf_errors"] += 1
+        logger.exception("Ошибка запроса к OpenRouter: %s", exc)
+        stats["ai_errors"] += 1
         return "Не получилось связаться с моделью ИИ. Попробуйте позже."
     except (KeyError, IndexError) as exc:
-        logger.exception("Неожиданный формат ответа HF: %s", exc)
-        stats["hf_errors"] += 1
+        logger.exception("Неожиданный формат ответа: %s", exc)
+        stats["ai_errors"] += 1
         return "Модель вернула непредвиденный ответ. Попробуйте ещё раз."
 
 
@@ -117,9 +118,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     total_users = len(stats["users"])
     total_messages = stats["total_messages"]
-    hf_errors = stats["hf_errors"]
+    ai_errors = stats["ai_errors"]
 
-    # Топ-5 самых активных пользователей
     top_users = sorted(stats["users"].items(), key=lambda item: item[1]["messages"], reverse=True)[:5]
     top_lines = []
     for user_id, info in top_users:
@@ -131,9 +131,9 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"📊 *Статистика {BOT_NAME}*\n\n"
         f"👥 Пользователей: {total_users}\n"
         f"💬 Сообщений обработано: {total_messages}\n"
-        f"⚠️ Ошибок Hugging Face: {hf_errors}\n"
+        f"⚠️ Ошибок ИИ: {ai_errors}\n"
         f"⏱ Аптайм: {hours}ч {minutes}м {seconds}с\n"
-        f"🧠 Модель: {HF_MODEL}\n\n"
+        f"🧠 Модель: {OPENROUTER_MODEL}\n\n"
         f"🏆 Топ активных:\n{top_text}"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -147,7 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    reply = query_huggingface(chat_id, user_message)
+    reply = query_ai(chat_id, user_message)
 
     history = chat_history.setdefault(chat_id, [])
     history.append({"role": "user", "content": user_message})
@@ -166,8 +166,29 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", admin_stats))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("%s запущен, используется модель %s", BOT_NAME, HF_MODEL)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("%s запущен, используется модель %s", BOT_NAME, OPENROUTER_MODEL)
+
+    # Render Free Web Service не поддерживает постоянный процесс с polling —
+    # вместо этого бот принимает обновления через webhook на порту, который
+    # даёт Render (переменная PORT), и адресу, который Render даёт сервису
+    # (переменная RENDER_EXTERNAL_URL — подставляется автоматически).
+    port = int(os.environ.get("PORT", "10000"))
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if external_url:
+        # Продакшн на Render: webhook-режим, бесплатный Web Service
+        url_path = TELEGRAM_BOT_TOKEN  # секретный путь, чтобы левые запросы не триггерили бота
+        webhook_url = f"{external_url}/{url_path}"
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        # Локальный запуск / отладка: обычный polling
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
