@@ -6,9 +6,11 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
     envVars:
-      - key: TELEGRAM_BOT_TOKEN
+      - key: 8825710197:AAGAQIHAP0lHgdJ0IvYxODDlHIPW7Tof25s
         sync: false
-      - key: HF_API_KEY
+      - key: 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
         sync: false
       - key: HF_MODEL
-        value: "HuggingFaceH4/zephyr-7b-beta"
+        value: "deepseek-ai/DeepSeek-V3"
+      - key: ADMIN_ID
+        value: "8080874290"
