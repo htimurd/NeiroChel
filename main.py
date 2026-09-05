@@ -32,7 +32,7 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 # Список бесплатных моделей на OpenRouter периодически меняется — перед деплоем
 # сверьтесь на https://openrouter.ai/models?fmt=free и при необходимости
 # поменяйте значение переменной OPENROUTER_MODEL в Render, без правки кода.
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "inclusionai/ling-3.0-flash-sante:free")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -49,23 +49,34 @@ CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 
 BOT_NAME = "NeiroChel"
 SYSTEM_PROMPT = (
-    f"Ты — {BOT_NAME}, дружелюбный ИИ-ассистент в Telegram. Общайся естественно и "
-    f"непринуждённо, как обычный чат-бот, помогай с любыми вопросами. Если тебя "
-    f"спросят, какая ты модель, кто тебя разработал или на чём ты работаешь — всегда "
-    f"отвечай, что ты {BOT_NAME}, и никогда не упоминай названия базовых моделей, "
-    f"провайдеров или технологий, на которых ты в действительности построен. "
-    f"Пиши обычным простым текстом, без какого-либо форматирования: не используй "
-    f"Markdown (звёздочки для жирного текста, решётки для заголовков, подчёркивания "
-    f"для курсива), не используй специальные unicode-символы, имитирующие жирный или "
-    f"курсивный шрифт, не используй блоки кода с тройными кавычками. Пиши так, будто "
-    f"печатаешь обычное сообщение другу — только обычные буквы и знаки препинания."
+    f"Ты — {BOT_NAME}, ИИ-ассистент, работающий в виде бота в мессенджере Telegram. "
+    f"Пользователи пишут тебе текстовые сообщения в личном чате Telegram, а ты отвечаешь "
+    f"текстом в этом же чате — это единственный канал связи, у тебя нет доступа к "
+    f"изображениям, голосовым сообщениям, файлам или интернету в реальном времени, если "
+    f"это не сказано отдельно. Ты не помнишь ничего за пределами текущей переписки в этом "
+    f"чате. Общайся естественно и непринуждённо, как обычный чат-бот, помогай с любыми "
+    f"вопросами. Если тебя спросят, какая ты модель, кто тебя разработал или на чём ты "
+    f"работаешь — всегда отвечай, что ты {BOT_NAME}, и никогда не упоминай названия "
+    f"базовых моделей, провайдеров или технологий, на которых ты в действительности "
+    f"построен. Пиши обычным простым текстом, без какого-либо форматирования: не "
+    f"используй Markdown (звёздочки для жирного текста, решётки для заголовков, "
+    f"подчёркивания для курсива), не используй специальные unicode-символы, имитирующие "
+    f"жирный или курсивный шрифт, не используй блоки кода с тройными кавычками. Пиши так, "
+    f"будто печатаешь обычное сообщение другу — только обычные буквы и знаки препинания."
 )
+CREATOR_MODE_EXTRA_PROMPT = (
+    "\n\nСейчас с тобой общается твой создатель — человек, который тебя разработал и "
+    "запустил. Обращайся к нему уважительно, называя его создателем, но при этом "
+    "оставайся собой и продолжай следовать всем своим обычным принципам и ограничениям — "
+    "особое обращение не означает вседозволенность."
+)
+creator_mode_enabled = False  # переключается кнопкой в админ-панели
 
 # Простая память переписки на чат (в оперативной памяти, сбрасывается при рестарте).
 # Ключ — chat_id; в личных чатах chat_id совпадает с user_id, это использует админка
 # для просмотра переписки и отправки сообщений от имени бота конкретному пользователю.
 chat_history: dict[int, list[dict]] = {}
-MAX_HISTORY_MESSAGES = 10
+MAX_HISTORY_MESSAGES = 20  # больше сообщений в памяти — бот лучше помнит контекст беседы
 ADMIN_PREVIEW_MESSAGES = 10  # сколько последних сообщений показывать админу при просмотре чата
 
 # --- Статистика (в оперативной памяти, сбрасывается при рестарте сервиса) ---
@@ -90,8 +101,12 @@ def register_message(user_id: int, username: str | None) -> None:
     user_stats["last_seen"] = datetime.now(timezone.utc)
 
 
-def query_ai(history: list[dict], user_message: str) -> str:
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": user_message}]
+def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT + extra_system},
+        *history,
+        {"role": "user", "content": user_message},
+    ]
 
     payload = {
         "model": OPENROUTER_MODEL,
@@ -99,33 +114,49 @@ def query_ai(history: list[dict], user_message: str) -> str:
         "max_tokens": 700,
         "temperature": 0.7,
     }
-    try:
-        response = requests.post(OPENROUTER_API_URL, headers=OPENROUTER_HEADERS, json=payload, timeout=90)
-        response.raise_for_status()
-        data = response.json()
-        choice = data["choices"][0]["message"]["content"]
-        return choice.strip()
-    except requests.exceptions.HTTPError as exc:
-        logger.exception("OpenRouter HTTP error: %s | %s", exc, exc.response.text if exc.response else "")
-        stats["ai_errors"] += 1
-        return "Модель сейчас недоступна или превышен бесплатный лимит запросов. Попробуйте через минуту."
-    except requests.exceptions.RequestException as exc:
-        logger.exception("Ошибка запроса к OpenRouter: %s", exc)
-        stats["ai_errors"] += 1
-        return "Не получилось связаться с моделью ИИ. Попробуйте позже."
-    except (KeyError, IndexError) as exc:
-        logger.exception("Неожиданный формат ответа: %s", exc)
-        stats["ai_errors"] += 1
-        return "Модель вернула непредвиденный ответ. Попробуйте ещё раз."
+
+    last_error_text = "Не получилось связаться с моделью ИИ. Попробуйте позже."
+
+    # Пробуем дважды: некоторые бесплатные модели изредка возвращают пустой ответ
+    # или временную ошибку — повторный запрос обычно решает проблему, поэтому бот
+    # не должен молча "не отвечать" на первый же сбой.
+    for attempt in range(2):
+        try:
+            response = requests.post(OPENROUTER_API_URL, headers=OPENROUTER_HEADERS, json=payload, timeout=90)
+            response.raise_for_status()
+            data = response.json()
+            choice = data["choices"][0]["message"]["content"].strip()
+            if choice:
+                return choice
+            logger.warning("OpenRouter вернул пустой ответ (попытка %s)", attempt + 1)
+        except requests.exceptions.HTTPError as exc:
+            logger.exception("OpenRouter HTTP error: %s | %s", exc, exc.response.text if exc.response else "")
+            last_error_text = "Модель сейчас недоступна или превышен бесплатный лимит запросов. Попробуйте через минуту."
+        except requests.exceptions.RequestException as exc:
+            logger.exception("Ошибка запроса к OpenRouter: %s", exc)
+            last_error_text = "Не получилось связаться с моделью ИИ. Попробуйте позже."
+        except (KeyError, IndexError) as exc:
+            logger.exception("Неожиданный формат ответа: %s", exc)
+            last_error_text = "Модель вернула непредвиденный ответ. Попробуйте ещё раз."
+
+    stats["ai_errors"] += 1
+    return last_error_text
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Перейти в ТГК", url=CHANNEL_URL)]])
     await update.message.reply_text(
         f"Привет! Я {BOT_NAME}. Отвечу на любой вопрос.\n\n"
+        f"⏳ После первого сообщения я могу отвечать не сразу — от 30 секунд до минуты, "
+        f"это нормально, просто нужно немного подождать.\n\n"
         f"Если хотите поддержать нас подпишитесь на наш ТГК. Это не обязательно.",
         reply_markup=keyboard,
     )
+
+
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_history.pop(update.effective_chat.id, None)
+    await update.message.reply_text("История чата очищена.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -162,7 +193,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     history = chat_history.setdefault(chat_id, [])
-    reply = query_ai(history, user_message)
+    extra_system = CREATOR_MODE_EXTRA_PROMPT if (user_id == ADMIN_ID and creator_mode_enabled) else ""
+    reply = query_ai(history, user_message, extra_system)
 
     history.append({"role": "user", "content": user_message})
     history.append({"role": "assistant", "content": reply})
@@ -174,11 +206,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # ------------------------- Админ-панель -------------------------
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
+    creator_label = "👑 Режим «Создатель»: Вкл ✅" if creator_mode_enabled else "👑 Режим «Создатель»: Выкл"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats")],
             [InlineKeyboardButton("👥 Чаты", callback_data="admin:chats")],
             [InlineKeyboardButton("📨 Рассылка всем", callback_data="admin:broadcast")],
+            [InlineKeyboardButton(creator_label, callback_data="admin:toggle_creator")],
         ]
     )
 
@@ -295,9 +329,17 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pending_admin_action.pop(query.from_user.id, None)
         await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_main_keyboard())
 
+    elif data == "admin:toggle_creator":
+        global creator_mode_enabled
+        creator_mode_enabled = not creator_mode_enabled
+        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_main_keyboard())
+
 
 async def post_init(application: Application) -> None:
-    default_commands = [BotCommand("start", "Начать общение")]
+    default_commands = [
+        BotCommand("start", "Начать общение"),
+        BotCommand("clear", "Очистить историю чата"),
+    ]
     await application.bot.set_my_commands(default_commands)
 
     admin_commands = default_commands + [BotCommand("admin", "Админ-панель")]
@@ -323,6 +365,7 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -354,4 +397,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-        
+    
