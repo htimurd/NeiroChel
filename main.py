@@ -4,9 +4,16 @@ import time
 import asyncio
 from datetime import datetime, timezone
 import requests
-from telegram import Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -34,12 +41,27 @@ OPENROUTER_HEADERS = {
 }
 
 # ID администратора — только этот пользователь Telegram видит статистику через /stats
+# и не обязан подписываться на канал, чтобы пользоваться ботом.
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8080874290"))
 
-BOT_NAME = "NeiroChel"
-SYSTEM_PROMPT = f"Ты — {BOT_NAME}, дружелюбный и полезный ассистент."
+# Официальный канал — без подписки на него бот не отвечает на сообщения.
+# ВАЖНО: бот должен быть добавлен в канал как администратор, иначе проверка
+# подписки не сработает (Telegram не даёт статус участников бот-не-админам).
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "neirochel_official")
+CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 
-# Простая память последних сообщений на чат (в оперативной памяти, сбрасывается при рестарте)
+BOT_NAME = "NeiroChel"
+SYSTEM_PROMPT = (
+    f"Ты — {BOT_NAME}, дружелюбный ИИ-ассистент в Telegram. Общайся естественно и "
+    f"непринуждённо, как обычный чат-бот, помогай с любыми вопросами. Если тебя "
+    f"спросят, какая ты модель, кто тебя разработал или на чём ты работаешь — всегда "
+    f"отвечай, что ты {BOT_NAME}, и никогда не упоминай названия базовых моделей, "
+    f"провайдеров или технологий, на которых ты в действительности построен."
+)
+
+# Простая память последних сообщений на чат (в оперативной памяти, сбрасывается при рестарте).
+# Ключ — chat_id, поэтому у каждого чата (личного или группового) своя независимая история —
+# это и есть "система чатов": сообщения одного пользователя не подмешиваются в диалог другого.
 chat_history: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 10
 
@@ -90,20 +112,67 @@ def query_ai(chat_id: int, user_message: str) -> str:
         return "Модель вернула непредвиденный ответ. Попробуйте ещё раз."
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def subscription_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_URL)],
+            [InlineKeyboardButton("✅ Я подписался", callback_data="check_subscription")],
+        ]
+    )
+
+
+async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as exc:
+        # Если проверка не удалась (например, бот ещё не добавлен в канал как админ) —
+        # не блокируем пользователей полностью, а пропускаем и пишем в лог для отладки.
+        logger.warning("Не удалось проверить подписку на канал: %s", exc)
+        return True
+
+
+async def ensure_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_id = update.effective_user.id
+    if user_id == ADMIN_ID:
+        return True
+    if await is_user_subscribed(context, user_id):
+        return True
     await update.message.reply_text(
-        f"Привет! Я {BOT_NAME} 🤖\nСпрашивай меня об чём угодно, я всё знаю!"
+        f"Чтобы начать общение с {BOT_NAME}, подпишись на наш канал 👇\nПосле подписки нажми «Я подписался».",
+        reply_markup=subscription_keyboard(),
+    )
+    return False
+
+
+async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    if await is_user_subscribed(context, user_id):
+        await query.answer("Подписка подтверждена ✅")
+        await query.edit_message_text(
+            f"Спасибо за подписку! Теперь можно общаться со мной 🤖\nПросто напиши сообщение."
+        )
+    else:
+        await query.answer("Пока не вижу подписки. Подпишись и попробуй снова.", show_alert=True)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_subscribed(update, context):
+        return
+    await update.message.reply_text(
+        f"Привет! Я {BOT_NAME} 🤖\nПросто напиши мне сообщение, и я отвечу с помощью ИИ."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды:\n/start — начать\n/reset — очистить историю диалога\n"
+        "Команды:\n/start — начать\n/clear — очистить историю диалога\n"
         "Просто пиши сообщения — отвечаю с помощью модели ИИ."
     )
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_history.pop(update.effective_chat.id, None)
     await update.message.reply_text("История диалога очищена.")
 
@@ -128,8 +197,10 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         top_lines.append(f"  • {uname} — {info['messages']} сообщ.")
     top_text = "\n".join(top_lines) if top_lines else "  (пока нет данных)"
 
+    # Без parse_mode: юзернеймы могут содержать "_", что ломает Markdown-разметку
+    # Telegram и приводит к молчаливому провалу отправки сообщения.
     text = (
-        f"📊 *Статистика {BOT_NAME}*\n\n"
+        f"📊 Статистика {BOT_NAME}\n\n"
         f"👥 Пользователей: {total_users}\n"
         f"💬 Сообщений обработано: {total_messages}\n"
         f"⚠️ Ошибок ИИ: {ai_errors}\n"
@@ -137,10 +208,13 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🧠 Модель: {OPENROUTER_MODEL}\n\n"
         f"🏆 Топ активных:\n{top_text}"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_subscribed(update, context):
+        return
+
     chat_id = update.effective_chat.id
     user_message = update.message.text
 
@@ -158,6 +232,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(reply)
 
 
+async def post_init(application: Application) -> None:
+    # Меню команд (кнопка "Menu" рядом с полем ввода в Telegram)
+    default_commands = [
+        BotCommand("start", "Начать общение"),
+        BotCommand("help", "Помощь и список команд"),
+        BotCommand("clear", "Очистить историю диалога"),
+    ]
+    await application.bot.set_my_commands(default_commands)
+
+    # У администратора в меню дополнительно появляется /stats
+    admin_commands = default_commands + [BotCommand("stats", "Статистика бота (админ)")]
+    try:
+        await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception as exc:
+        logger.warning(
+            "Не удалось установить меню команд для админа (возможно, админ ещё ни разу не писал боту): %s", exc
+        )
+
+
 def main() -> None:
     # В Python 3.14 asyncio.get_event_loop() больше не создаёт цикл событий
     # автоматически, если он не был явно установлен — а именно так делает
@@ -169,12 +262,14 @@ def main() -> None:
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("reset", reset))
+    application.add_handler(CommandHandler("clear", clear_history))
+    application.add_handler(CommandHandler("reset", clear_history))  # старое название команды, для совместимости
     application.add_handler(CommandHandler("stats", admin_stats))
+    application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("%s запущен, используется модель %s", BOT_NAME, OPENROUTER_MODEL)
