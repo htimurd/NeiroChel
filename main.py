@@ -43,6 +43,10 @@ OPENROUTER_HEADERS = {
 # ID администратора — только этот пользователь видит /admin
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8080874290"))
 
+# Официальный канал — подписка необязательна, просто кнопка в приветствии
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "neirochel_official")
+CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
+
 BOT_NAME = "NeiroChel"
 SYSTEM_PROMPT = (
     f"Ты — {BOT_NAME}, дружелюбный ИИ-ассистент в Telegram. Общайся естественно и "
@@ -116,8 +120,11 @@ def query_ai(history: list[dict], user_message: str) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Перейти в ТГК", url=CHANNEL_URL)]])
     await update.message.reply_text(
-        f"Привет! Я {BOT_NAME} 🤖\nПросто напиши мне сообщение, и я отвечу с помощью ИИ."
+        f"Привет! Я {BOT_NAME}. Отвечу на любой вопрос.\n\n"
+        f"Если хотите поддержать нас подпишитесь на наш ТГК. Это не обязательно.",
+        reply_markup=keyboard,
     )
 
 
@@ -339,4 +346,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
+        
