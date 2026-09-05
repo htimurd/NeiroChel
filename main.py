@@ -29,10 +29,17 @@ logger = logging.getLogger("NeiroChel")
 # --- Настройки берутся из переменных окружения (задаются в Render, не в коде!) ---
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-# Список бесплатных моделей на OpenRouter периодически меняется — перед деплоем
-# сверьтесь на https://openrouter.ai/models?fmt=free и при необходимости
-# поменяйте значение переменной OPENROUTER_MODEL в Render, без правки кода.
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "thinkingmachines/inkling:free")
+# Список бесплатных моделей на OpenRouter периодически меняется/блокируется —
+# вместо одной модели задаём цепочку через запятую: бот пробует их по очереди
+# и использует первую, которая ответила успешно. Можно переопределить через
+# переменную OPENROUTER_MODELS в Render, без правки кода.
+OPENROUTER_MODELS = os.environ.get(
+    "OPENROUTER_MODELS",
+    "google/gemma-4-31b-it:free,"
+    "minimax/minimax-m3:free,"
+    "nvidia/nemotron-3-ultra-550b-a55b:free,"
+    "thinkingmachines/inkling:free",
+).split(",")
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -108,19 +115,18 @@ def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> 
         {"role": "user", "content": user_message},
     ]
 
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": messages,
-        "max_tokens": 700,
-        "temperature": 0.7,
-    }
-
     last_error_text = "Не получилось связаться с моделью ИИ. Попробуйте позже."
 
-    # Пробуем дважды: некоторые бесплатные модели изредка возвращают пустой ответ
-    # или временную ошибку — повторный запрос обычно решает проблему, поэтому бот
-    # не должен молча "не отвечать" на первый же сбой.
-    for attempt in range(2):
+    # Пробуем модели по очереди из OPENROUTER_MODELS: если одна недоступна (404/403/пустой
+    # ответ), сразу переходим к следующей. Это защищает от ситуаций, когда конкретная
+    # бесплатная модель внезапно пропадает из каталога OpenRouter или временно перегружена.
+    for model in OPENROUTER_MODELS:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 700,
+            "temperature": 0.7,
+        }
         try:
             response = requests.post(OPENROUTER_API_URL, headers=OPENROUTER_HEADERS, json=payload, timeout=90)
             response.raise_for_status()
@@ -128,15 +134,20 @@ def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> 
             choice = data["choices"][0]["message"]["content"].strip()
             if choice:
                 return choice
-            logger.warning("OpenRouter вернул пустой ответ (попытка %s)", attempt + 1)
+            logger.warning("Модель %s вернула пустой ответ, пробуем следующую", model)
         except requests.exceptions.HTTPError as exc:
-            logger.exception("OpenRouter HTTP error: %s | %s", exc, exc.response.text if exc.response else "")
+            logger.warning(
+                "Модель %s недоступна (%s), пробуем следующую: %s",
+                model,
+                exc.response.status_code if exc.response else "?",
+                exc.response.text if exc.response else "",
+            )
             last_error_text = "Модель сейчас недоступна или превышен бесплатный лимит запросов. Попробуйте через минуту."
         except requests.exceptions.RequestException as exc:
-            logger.exception("Ошибка запроса к OpenRouter: %s", exc)
+            logger.exception("Ошибка запроса к OpenRouter (модель %s): %s", model, exc)
             last_error_text = "Не получилось связаться с моделью ИИ. Попробуйте позже."
         except (KeyError, IndexError) as exc:
-            logger.exception("Неожиданный формат ответа: %s", exc)
+            logger.exception("Неожиданный формат ответа от модели %s: %s", model, exc)
             last_error_text = "Модель вернула непредвиденный ответ. Попробуйте ещё раз."
 
     stats["ai_errors"] += 1
@@ -239,7 +250,7 @@ def build_stats_text() -> str:
         f"💬 Сообщений обработано: {total_messages}\n"
         f"⚠️ Ошибок ИИ: {ai_errors}\n"
         f"⏱ Аптайм: {hours}ч {minutes}м {seconds}с\n"
-        f"🧠 Модель: {OPENROUTER_MODEL}\n\n"
+        f"🧠 Модели (по порядку): {', '.join(OPENROUTER_MODELS)}\n\n"
         f"🏆 Топ активных:\n{top_text}"
     )
 
@@ -370,7 +381,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("%s запущен, используется модель %s", BOT_NAME, OPENROUTER_MODEL)
+    logger.info("%s запущен, цепочка моделей: %s", BOT_NAME, ", ".join(OPENROUTER_MODELS))
 
     # Render Free Web Service не поддерживает постоянный процесс с polling —
     # вместо этого бот принимает обновления через webhook на порту, который
