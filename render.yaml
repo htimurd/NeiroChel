@@ -1,6 +1,6 @@
 services:
-  - type: worker
-    name: kanger-ai-bot
+  - type: web
+    name: neirochel-bot
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
@@ -8,9 +8,9 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: HF_API_KEY
+      - key: OPENROUTER_API_KEY
         sync: false
-      - key: HF_MODEL
-        value: "deepseek-ai/DeepSeek-V3"
+      - key: OPENROUTER_MODEL
+        value: "deepseek/deepseek-chat-v3.1:free"
       - key: ADMIN_ID
         value: "8080874290"
