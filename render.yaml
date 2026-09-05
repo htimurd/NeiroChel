@@ -6,9 +6,9 @@ services:
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python main.py"
     envVars:
-      - key: 8825710197:AAGAQIHAP0lHgdJ0IvYxODDlHIPW7Tof25s
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: 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
+      - key: HF_API_KEY
         sync: false
       - key: HF_MODEL
         value: "deepseek-ai/DeepSeek-V3"
