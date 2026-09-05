@@ -32,7 +32,7 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 # Список бесплатных моделей на OpenRouter периодически меняется — перед деплоем
 # сверьтесь на https://openrouter.ai/models?fmt=free и при необходимости
 # поменяйте значение переменной OPENROUTER_MODEL в Render, без правки кода.
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "thinkingmachines/inkling:free")
 
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_HEADERS = {
@@ -397,4 +397,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
