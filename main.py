@@ -276,16 +276,24 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data.startswith("admin:write:"):
         target_id = int(data.split(":")[2])
         pending_admin_action[query.from_user.id] = {"action": "write", "target_user_id": target_id}
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="admin:cancel")]])
         await query.edit_message_text(
             f"✍️ Напишите сообщение — оно будет отправлено пользователю от имени бота.\n"
-            f"(следующее ваше сообщение боту уйдёт пользователю id{target_id})"
+            f"(следующее ваше сообщение боту уйдёт пользователю id{target_id})",
+            reply_markup=keyboard,
         )
 
     elif data == "admin:broadcast":
         pending_admin_action[query.from_user.id] = {"action": "broadcast"}
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="admin:cancel")]])
         await query.edit_message_text(
-            "📨 Напишите текст рассылки — следующее ваше сообщение будет отправлено всем известным пользователям."
+            "📨 Напишите текст рассылки — следующее ваше сообщение будет отправлено всем известным пользователям.",
+            reply_markup=keyboard,
         )
+
+    elif data == "admin:cancel":
+        pending_admin_action.pop(query.from_user.id, None)
+        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_main_keyboard())
 
 
 async def post_init(application: Application) -> None:
