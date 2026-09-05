@@ -11,6 +11,6 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENROUTER_MODEL
-        value: "deepseek/deepseek-chat-v3.1:free"
+        value: "inclusionai/ling-3.0-flash-sante:free"
       - key: ADMIN_ID
         value: "8080874290"
