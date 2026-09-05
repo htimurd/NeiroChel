@@ -40,15 +40,8 @@ OPENROUTER_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# ID администратора — только этот пользователь Telegram видит статистику через /stats
-# и не обязан подписываться на канал, чтобы пользоваться ботом.
+# ID администратора — только этот пользователь видит /admin
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8080874290"))
-
-# Официальный канал — без подписки на него бот не отвечает на сообщения.
-# ВАЖНО: бот должен быть добавлен в канал как администратор, иначе проверка
-# подписки не сработает (Telegram не даёт статус участников бот-не-админам).
-CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "neirochel_official")
-CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 
 BOT_NAME = "NeiroChel"
 SYSTEM_PROMPT = (
@@ -64,91 +57,25 @@ SYSTEM_PROMPT = (
     f"печатаешь обычное сообщение другу — только обычные буквы и знаки препинания."
 )
 
-# --- Система чатов: у каждого пользователя может быть несколько независимых диалогов
-# (как разные вкладки), между которыми можно переключаться, создавать новые и удалять
-# старые через кнопки. Хранится в памяти процесса, ключ — user_id.
-sessions: dict[int, dict] = {}
+# Простая память переписки на чат (в оперативной памяти, сбрасывается при рестарте).
+# Ключ — chat_id; в личных чатах chat_id совпадает с user_id, это использует админка
+# для просмотра переписки и отправки сообщений от имени бота конкретному пользователю.
+chat_history: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 10
+ADMIN_PREVIEW_MESSAGES = 10  # сколько последних сообщений показывать админу при просмотре чата
 
-
-def get_session(user_id: int) -> dict:
-    if user_id not in sessions:
-        sessions[user_id] = {
-            "chats": {"1": {"name": "Чат 1", "history": []}},
-            "active": "1",
-            "counter": 1,
-        }
-    return sessions[user_id]
-
-
-def get_active_chat(user_id: int) -> dict:
-    session = get_session(user_id)
-    return session["chats"][session["active"]]
-
-
-def build_chats_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    session = get_session(user_id)
-    rows = []
-    for chat_id, chat in session["chats"].items():
-        marker = "✅ " if chat_id == session["active"] else "💬 "
-        rows.append(
-            [
-                InlineKeyboardButton(f"{marker}{chat['name']}", callback_data=f"switch:{chat_id}"),
-                InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{chat_id}"),
-            ]
-        )
-    rows.append([InlineKeyboardButton("➕ Новый чат", callback_data="newchat")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_subscribed(update, context):
-        return
-    user_id = update.effective_user.id
-    await update.message.reply_text("Ваши чаты:", reply_markup=build_chats_keyboard(user_id))
-
-
-async def chats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user_id = query.from_user.id
-    data = query.data
-    session = get_session(user_id)
-
-    if data == "newchat":
-        session["counter"] += 1
-        new_id = str(session["counter"])
-        session["chats"][new_id] = {"name": f"Чат {new_id}", "history": []}
-        session["active"] = new_id
-        await query.answer("Создан новый чат")
-    elif data.startswith("switch:"):
-        chat_id = data.split(":", 1)[1]
-        if chat_id in session["chats"]:
-            session["active"] = chat_id
-            await query.answer(f"Переключено на {session['chats'][chat_id]['name']}")
-        else:
-            await query.answer("Чат не найден", show_alert=True)
-    elif data.startswith("delete:"):
-        chat_id = data.split(":", 1)[1]
-        if chat_id not in session["chats"]:
-            await query.answer("Чат не найден", show_alert=True)
-        elif len(session["chats"]) == 1:
-            await query.answer("Нельзя удалить последний оставшийся чат", show_alert=True)
-        else:
-            del session["chats"][chat_id]
-            if session["active"] == chat_id:
-                session["active"] = next(iter(session["chats"]))
-            await query.answer("Чат удалён")
-
-    await query.edit_message_text("Ваши чаты:", reply_markup=build_chats_keyboard(user_id))
-
-
-# --- Статистика для админ-панели (в оперативной памяти, сбрасывается при рестарте сервиса) ---
+# --- Статистика (в оперативной памяти, сбрасывается при рестарте сервиса) ---
 BOT_START_TIME = time.monotonic()
 stats = {
     "total_messages": 0,   # сколько сообщений всего обработано
     "users": {},           # user_id -> {"username": str, "messages": int, "last_seen": datetime}
     "ai_errors": 0,        # сколько раз модель ИИ вернула ошибку
 }
+
+# Отложенное действие админа: после нажатия "Написать"/"Рассылка" следующее текстовое
+# сообщение админа перехватывается и используется как текст для отправки, а не как
+# обычное сообщение для ИИ. admin_id -> {"action": "write", "target_user_id": int} / {"action": "broadcast"}
+pending_admin_action: dict[int, dict] = {}
 
 
 def register_message(user_id: int, username: str | None) -> None:
@@ -188,81 +115,68 @@ def query_ai(history: list[dict], user_message: str) -> str:
         return "Модель вернула непредвиденный ответ. Попробуйте ещё раз."
 
 
-def subscription_keyboard() -> InlineKeyboardMarkup:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"Привет! Я {BOT_NAME} 🤖\nПросто напиши мне сообщение, и я отвечу с помощью ИИ."
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    user_message = update.message.text
+
+    # Если админ до этого нажал "Написать" или "Рассылка" — это сообщение
+    # перехватывается как текст для отправки, а не идёт в ИИ.
+    if user_id == ADMIN_ID and user_id in pending_admin_action:
+        action = pending_admin_action.pop(user_id)
+        if action["action"] == "write":
+            target_id = action["target_user_id"]
+            try:
+                await context.bot.send_message(chat_id=target_id, text=user_message)
+                chat_history.setdefault(target_id, []).append({"role": "assistant", "content": user_message})
+                await update.message.reply_text("✅ Сообщение отправлено пользователю.")
+            except Exception as exc:
+                logger.exception("Не удалось отправить сообщение пользователю %s: %s", target_id, exc)
+                await update.message.reply_text(f"⚠️ Не удалось отправить сообщение: {exc}")
+        elif action["action"] == "broadcast":
+            sent, failed = 0, 0
+            for uid in list(stats["users"].keys()):
+                try:
+                    await context.bot.send_message(chat_id=uid, text=user_message)
+                    sent += 1
+                except Exception:
+                    failed += 1
+            await update.message.reply_text(f"📨 Рассылка завершена.\nОтправлено: {sent}\nОшибок: {failed}")
+        return
+
+    register_message(user_id, update.effective_user.username)
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    history = chat_history.setdefault(chat_id, [])
+    reply = query_ai(history, user_message)
+
+    history.append({"role": "user", "content": user_message})
+    history.append({"role": "assistant", "content": reply})
+    chat_history[chat_id] = history[-MAX_HISTORY_MESSAGES:]
+
+    await update.message.reply_text(reply)
+
+
+# ------------------------- Админ-панель -------------------------
+
+def admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📢 Подписаться на канал", url=CHANNEL_URL)],
-            [InlineKeyboardButton("✅ Я подписался", callback_data="check_subscription")],
+            [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats")],
+            [InlineKeyboardButton("👥 Чаты", callback_data="admin:chats")],
+            [InlineKeyboardButton("📨 Рассылка всем", callback_data="admin:broadcast")],
         ]
     )
 
 
-async def is_user_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    try:
-        member = await context.bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
-        return member.status in ("member", "administrator", "creator")
-    except Exception as exc:
-        # Если проверка не удалась (например, бот ещё не добавлен в канал как админ) —
-        # не блокируем пользователей полностью, а пропускаем и пишем в лог для отладки.
-        logger.warning("Не удалось проверить подписку на канал: %s", exc)
-        return True
-
-
-async def ensure_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    if user_id == ADMIN_ID:
-        return True
-    if await is_user_subscribed(context, user_id):
-        return True
-    await update.message.reply_text(
-        f"Чтобы начать общение с {BOT_NAME}, подпишись на наш канал 👇\nПосле подписки нажми «Я подписался».",
-        reply_markup=subscription_keyboard(),
-    )
-    return False
-
-
-async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user_id = query.from_user.id
-    if await is_user_subscribed(context, user_id):
-        await query.answer("Подписка подтверждена ✅")
-        await query.edit_message_text(
-            f"Спасибо за подписку! Теперь можно общаться со мной 🤖\nПросто напиши сообщение."
-        )
-    else:
-        await query.answer("Пока не вижу подписки. Подпишись и попробуй снова.", show_alert=True)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_subscribed(update, context):
-        return
-    await update.message.reply_text(
-        f"Привет! Я {BOT_NAME} 🤖\nПросто напиши мне сообщение, и я отвечу с помощью ИИ.\n"
-        f"Команда /chats — управление чатами (несколько независимых диалогов)."
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Команды:\n"
-        "/start — начать\n"
-        "/chats — мои чаты (переключение, новый, удаление)\n"
-        "/clear — очистить историю текущего чата\n"
-        "Просто пиши сообщения — отвечаю с помощью модели ИИ."
-    )
-
-
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    get_active_chat(user_id)["history"].clear()
-    await update.message.reply_text("История текущего чата очищена.")
-
-
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
-        return
-
+def build_stats_text() -> str:
     uptime_seconds = int(time.monotonic() - BOT_START_TIME)
     hours, remainder = divmod(uptime_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -278,9 +192,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         top_lines.append(f"  • {uname} — {info['messages']} сообщ.")
     top_text = "\n".join(top_lines) if top_lines else "  (пока нет данных)"
 
-    # Без parse_mode: юзернеймы могут содержать "_", что ломает Markdown-разметку
-    # Telegram и приводит к молчаливому провалу отправки сообщения.
-    text = (
+    return (
         f"📊 Статистика {BOT_NAME}\n\n"
         f"👥 Пользователей: {total_users}\n"
         f"💬 Сообщений обработано: {total_messages}\n"
@@ -289,45 +201,91 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"🧠 Модель: {OPENROUTER_MODEL}\n\n"
         f"🏆 Топ активных:\n{top_text}"
     )
-    await update.message.reply_text(text)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await ensure_subscribed(update, context):
+def build_users_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for user_id, info in stats["users"].items():
+        label = f"@{info['username']}" if info["username"] else f"id{user_id}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"admin:chat:{user_id}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("(пока нет пользователей)", callback_data="admin:main")])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="admin:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_chat_preview_text(user_id: int) -> str:
+    info = stats["users"].get(user_id, {})
+    label = f"@{info.get('username')}" if info.get("username") else f"id{user_id}"
+    history = chat_history.get(user_id, [])
+    last_messages = history[-ADMIN_PREVIEW_MESSAGES:]
+    if not last_messages:
+        body = "(переписки пока нет)"
+    else:
+        lines = []
+        for msg in last_messages:
+            who = "Пользователь" if msg["role"] == "user" else "Бот"
+            lines.append(f"{who}: {msg['content']}")
+        body = "\n".join(lines)
+    return f"💬 Чат с {label}\n\n{body}"
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
+        return
+    await update.message.reply_text("🛠 Админ-панель", reply_markup=admin_main_keyboard())
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("⛔ Нет доступа", show_alert=True)
         return
 
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    user_message = update.message.text
+    data = query.data
+    await query.answer()
 
-    register_message(user_id, update.effective_user.username)
+    if data == "admin:main":
+        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_main_keyboard())
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    elif data == "admin:stats":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin:main")]])
+        await query.edit_message_text(build_stats_text(), reply_markup=keyboard)
 
-    active_chat = get_active_chat(user_id)
-    history = active_chat["history"]
+    elif data == "admin:chats":
+        await query.edit_message_text("👥 Пользователи:", reply_markup=build_users_keyboard())
 
-    reply = query_ai(history, user_message)
+    elif data.startswith("admin:chat:"):
+        target_id = int(data.split(":")[2])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✍️ Написать от имени бота", callback_data=f"admin:write:{target_id}")],
+                [InlineKeyboardButton("🔙 К списку", callback_data="admin:chats")],
+            ]
+        )
+        await query.edit_message_text(build_chat_preview_text(target_id), reply_markup=keyboard)
 
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": reply})
-    active_chat["history"] = history[-MAX_HISTORY_MESSAGES:]
+    elif data.startswith("admin:write:"):
+        target_id = int(data.split(":")[2])
+        pending_admin_action[query.from_user.id] = {"action": "write", "target_user_id": target_id}
+        await query.edit_message_text(
+            f"✍️ Напишите сообщение — оно будет отправлено пользователю от имени бота.\n"
+            f"(следующее ваше сообщение боту уйдёт пользователю id{target_id})"
+        )
 
-    await update.message.reply_text(reply)
+    elif data == "admin:broadcast":
+        pending_admin_action[query.from_user.id] = {"action": "broadcast"}
+        await query.edit_message_text(
+            "📨 Напишите текст рассылки — следующее ваше сообщение будет отправлено всем известным пользователям."
+        )
 
 
 async def post_init(application: Application) -> None:
-    # Меню команд (кнопка "Menu" рядом с полем ввода в Telegram)
-    default_commands = [
-        BotCommand("start", "Начать общение"),
-        BotCommand("help", "Помощь и список команд"),
-        BotCommand("chats", "Мои чаты"),
-        BotCommand("clear", "Очистить историю текущего чата"),
-    ]
+    default_commands = [BotCommand("start", "Начать общение")]
     await application.bot.set_my_commands(default_commands)
 
-    # У администратора в меню дополнительно появляется /stats
-    admin_commands = default_commands + [BotCommand("stats", "Статистика бота (админ)")]
+    admin_commands = default_commands + [BotCommand("admin", "Админ-панель")]
     try:
         await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     except Exception as exc:
@@ -350,13 +308,8 @@ def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("chats", chats_command))
-    application.add_handler(CommandHandler("clear", clear_history))
-    application.add_handler(CommandHandler("reset", clear_history))  # старое название команды, для совместимости
-    application.add_handler(CommandHandler("stats", admin_stats))
-    application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
-    application.add_handler(CallbackQueryHandler(chats_callback, pattern="^(switch:|delete:|newchat$)"))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("%s запущен, используется модель %s", BOT_NAME, OPENROUTER_MODEL)
