@@ -2,8 +2,6 @@ import os
 import logging
 import time
 import asyncio
-import random
-import psutil
 from datetime import datetime, timezone
 import requests
 from telegram import (
@@ -449,4 +447,4 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "admin:toggle_creator":
         global creator_mode_enabled
         creator_mode_enabled = not creator_mode_enabled
-     
+        await query.edit_message_
