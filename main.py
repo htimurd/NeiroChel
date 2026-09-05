@@ -56,14 +56,91 @@ SYSTEM_PROMPT = (
     f"непринуждённо, как обычный чат-бот, помогай с любыми вопросами. Если тебя "
     f"спросят, какая ты модель, кто тебя разработал или на чём ты работаешь — всегда "
     f"отвечай, что ты {BOT_NAME}, и никогда не упоминай названия базовых моделей, "
-    f"провайдеров или технологий, на которых ты в действительности построен."
+    f"провайдеров или технологий, на которых ты в действительности построен. "
+    f"Пиши обычным простым текстом, без какого-либо форматирования: не используй "
+    f"Markdown (звёздочки для жирного текста, решётки для заголовков, подчёркивания "
+    f"для курсива), не используй специальные unicode-символы, имитирующие жирный или "
+    f"курсивный шрифт, не используй блоки кода с тройными кавычками. Пиши так, будто "
+    f"печатаешь обычное сообщение другу — только обычные буквы и знаки препинания."
 )
 
-# Простая память последних сообщений на чат (в оперативной памяти, сбрасывается при рестарте).
-# Ключ — chat_id, поэтому у каждого чата (личного или группового) своя независимая история —
-# это и есть "система чатов": сообщения одного пользователя не подмешиваются в диалог другого.
-chat_history: dict[int, list[dict]] = {}
+# --- Система чатов: у каждого пользователя может быть несколько независимых диалогов
+# (как разные вкладки), между которыми можно переключаться, создавать новые и удалять
+# старые через кнопки. Хранится в памяти процесса, ключ — user_id.
+sessions: dict[int, dict] = {}
 MAX_HISTORY_MESSAGES = 10
+
+
+def get_session(user_id: int) -> dict:
+    if user_id not in sessions:
+        sessions[user_id] = {
+            "chats": {"1": {"name": "Чат 1", "history": []}},
+            "active": "1",
+            "counter": 1,
+        }
+    return sessions[user_id]
+
+
+def get_active_chat(user_id: int) -> dict:
+    session = get_session(user_id)
+    return session["chats"][session["active"]]
+
+
+def build_chats_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    session = get_session(user_id)
+    rows = []
+    for chat_id, chat in session["chats"].items():
+        marker = "✅ " if chat_id == session["active"] else "💬 "
+        rows.append(
+            [
+                InlineKeyboardButton(f"{marker}{chat['name']}", callback_data=f"switch:{chat_id}"),
+                InlineKeyboardButton("🗑 Удалить", callback_data=f"delete:{chat_id}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton("➕ Новый чат", callback_data="newchat")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def chats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_subscribed(update, context):
+        return
+    user_id = update.effective_user.id
+    await update.message.reply_text("Ваши чаты:", reply_markup=build_chats_keyboard(user_id))
+
+
+async def chats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    session = get_session(user_id)
+
+    if data == "newchat":
+        session["counter"] += 1
+        new_id = str(session["counter"])
+        session["chats"][new_id] = {"name": f"Чат {new_id}", "history": []}
+        session["active"] = new_id
+        await query.answer("Создан новый чат")
+    elif data.startswith("switch:"):
+        chat_id = data.split(":", 1)[1]
+        if chat_id in session["chats"]:
+            session["active"] = chat_id
+            await query.answer(f"Переключено на {session['chats'][chat_id]['name']}")
+        else:
+            await query.answer("Чат не найден", show_alert=True)
+    elif data.startswith("delete:"):
+        chat_id = data.split(":", 1)[1]
+        if chat_id not in session["chats"]:
+            await query.answer("Чат не найден", show_alert=True)
+        elif len(session["chats"]) == 1:
+            await query.answer("Нельзя удалить последний оставшийся чат", show_alert=True)
+        else:
+            del session["chats"][chat_id]
+            if session["active"] == chat_id:
+                session["active"] = next(iter(session["chats"]))
+            await query.answer("Чат удалён")
+
+    await query.edit_message_text("Ваши чаты:", reply_markup=build_chats_keyboard(user_id))
+
 
 # --- Статистика для админ-панели (в оперативной памяти, сбрасывается при рестарте сервиса) ---
 BOT_START_TIME = time.monotonic()
@@ -82,8 +159,7 @@ def register_message(user_id: int, username: str | None) -> None:
     user_stats["last_seen"] = datetime.now(timezone.utc)
 
 
-def query_ai(chat_id: int, user_message: str) -> str:
-    history = chat_history.get(chat_id, [])
+def query_ai(history: list[dict], user_message: str) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": user_message}]
 
     payload = {
@@ -161,20 +237,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await ensure_subscribed(update, context):
         return
     await update.message.reply_text(
-        f"Привет! Я {BOT_NAME} 🤖\nПросто напиши мне сообщение, и я отвечу с помощью ИИ."
+        f"Привет! Я {BOT_NAME} 🤖\nПросто напиши мне сообщение, и я отвечу с помощью ИИ.\n"
+        f"Команда /chats — управление чатами (несколько независимых диалогов)."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Команды:\n/start — начать\n/clear — очистить историю диалога\n"
+        "Команды:\n"
+        "/start — начать\n"
+        "/chats — мои чаты (переключение, новый, удаление)\n"
+        "/clear — очистить историю текущего чата\n"
         "Просто пиши сообщения — отвечаю с помощью модели ИИ."
     )
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_history.pop(update.effective_chat.id, None)
-    await update.message.reply_text("История диалога очищена.")
+    user_id = update.effective_user.id
+    get_active_chat(user_id)["history"].clear()
+    await update.message.reply_text("История текущего чата очищена.")
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -215,19 +296,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not await ensure_subscribed(update, context):
         return
 
+    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     user_message = update.message.text
 
-    register_message(update.effective_user.id, update.effective_user.username)
+    register_message(user_id, update.effective_user.username)
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    reply = query_ai(chat_id, user_message)
+    active_chat = get_active_chat(user_id)
+    history = active_chat["history"]
 
-    history = chat_history.setdefault(chat_id, [])
+    reply = query_ai(history, user_message)
+
     history.append({"role": "user", "content": user_message})
     history.append({"role": "assistant", "content": reply})
-    chat_history[chat_id] = history[-MAX_HISTORY_MESSAGES:]
+    active_chat["history"] = history[-MAX_HISTORY_MESSAGES:]
 
     await update.message.reply_text(reply)
 
@@ -237,7 +321,8 @@ async def post_init(application: Application) -> None:
     default_commands = [
         BotCommand("start", "Начать общение"),
         BotCommand("help", "Помощь и список команд"),
-        BotCommand("clear", "Очистить историю диалога"),
+        BotCommand("chats", "Мои чаты"),
+        BotCommand("clear", "Очистить историю текущего чата"),
     ]
     await application.bot.set_my_commands(default_commands)
 
@@ -266,10 +351,12 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("chats", chats_command))
     application.add_handler(CommandHandler("clear", clear_history))
     application.add_handler(CommandHandler("reset", clear_history))  # старое название команды, для совместимости
     application.add_handler(CommandHandler("stats", admin_stats))
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
+    application.add_handler(CallbackQueryHandler(chats_callback, pattern="^(switch:|delete:|newchat$)"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("%s запущен, используется модель %s", BOT_NAME, OPENROUTER_MODEL)
