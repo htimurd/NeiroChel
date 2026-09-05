@@ -92,7 +92,7 @@ def query_ai(chat_id: int, user_message: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"Привет! Я {BOT_NAME} 🤖\nПросто напиши мне сообщение, и я отвечу с помощью ИИ."
+        f"Привет! Я {BOT_NAME} 🤖\nСпрашивай меня об чём угодно, я всё знаю!"
     )
 
 
