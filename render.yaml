@@ -12,8 +12,8 @@ services:
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
-      - key: OPENROUTER_MODEL
-        value: "thinkingmachines/inkling:free"
+      - key: OPENROUTER_MODELS
+        value: "google/gemma-4-31b-it:free,minimax/minimax-m3:free,nvidia/nemotron-3-ultra-550b-a55b:free,thinkingmachines/inkling:free"
       - key: ADMIN_ID
         value: "8080874290"
       - key: CHANNEL_USERNAME
