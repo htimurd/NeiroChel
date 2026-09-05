@@ -16,5 +16,3 @@ services:
         value: "inclusionai/ling-3.0-flash-sante:free"
       - key: ADMIN_ID
         value: "8080874290"
-      - key: CHANNEL_USERNAME
-        value: "neirochel_official"
