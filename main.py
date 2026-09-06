@@ -99,19 +99,6 @@ stats = {
 # обычное сообщение для ИИ. admin_id -> {"action": "write", "target_user_id": int} / {"action": "broadcast"}
 pending_admin_action: dict[int, dict] = {}
 
-# --- Тестовый режим: показывает после каждого ответа токены, время ответа и нагрузку
-# на сервер. Включается по коду, который генерирует админ в /admin.
-valid_test_code: str | None = None
-testing_mode_users: set[int] = set()
-
-
-def get_server_load() -> dict:
-    process = psutil.Process(os.getpid())
-    return {
-        "cpu_percent": psutil.cpu_percent(interval=0.1),
-        "memory_mb": process.memory_info().rss / (1024 * 1024),
-    }
-
 
 def register_message(user_id: int, username: str | None) -> None:
     stats["total_messages"] += 1
@@ -121,7 +108,7 @@ def register_message(user_id: int, username: str | None) -> None:
     user_stats["last_seen"] = datetime.now(timezone.utc)
 
 
-def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> tuple[str, dict]:
+def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT + extra_system},
         *history,
@@ -129,7 +116,6 @@ def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> 
     ]
 
     last_error_text = "Не получилось связаться с моделью ИИ. Попробуйте позже."
-    debug_info = {"model": None, "latency": 0.0, "usage": {}}
 
     # Пробуем модели по очереди из OPENROUTER_MODELS: если одна недоступна (404/403/пустой
     # ответ), сразу переходим к следующей. Это защищает от ситуаций, когда конкретная
@@ -141,16 +127,13 @@ def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> 
             "max_tokens": 700,
             "temperature": 0.7,
         }
-        request_started = time.monotonic()
         try:
             response = requests.post(OPENROUTER_API_URL, headers=OPENROUTER_HEADERS, json=payload, timeout=90)
-            elapsed = time.monotonic() - request_started
             response.raise_for_status()
             data = response.json()
             choice = data["choices"][0]["message"]["content"].strip()
             if choice:
-                debug_info.update({"model": model, "latency": elapsed, "usage": data.get("usage", {})})
-                return choice, debug_info
+                return choice
             logger.warning("Модель %s вернула пустой ответ, пробуем следующую", model)
         except requests.exceptions.HTTPError as exc:
             logger.warning(
@@ -168,7 +151,7 @@ def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> 
             last_error_text = "Модель вернула непредвиденный ответ. Попробуйте ещё раз."
 
     stats["ai_errors"] += 1
-    return last_error_text, debug_info
+    return last_error_text
 
 
 def get_start_text() -> str:
@@ -194,7 +177,6 @@ def build_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🏠 Начать", callback_data="menu:start")],
         [InlineKeyboardButton("🧹 Очистить историю", callback_data="menu:clear")],
-        [InlineKeyboardButton("🧪 Тестовый режим", callback_data="menu:testmode_info")],
     ]
     if user_id == ADMIN_ID:
         rows.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="menu:admin")])
@@ -219,43 +201,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         chat_history.pop(query.message.chat_id, None)
         await query.message.reply_text("История чата очищена.")
 
-    elif data == "menu:testmode_info":
-        await query.message.reply_text(
-            "🧪 Тестовый режим — после каждого ответа бот дополнительно показывает: "
-            "сколько токенов потрачено, какая модель отвечала, сколько заняло по времени "
-            "и текущую нагрузку на сервер (CPU и память).\n\n"
-            "Код для включения выдаёт администратор в /admin. Когда код есть, отправьте:\n"
-            "/testmode КОД\n\n"
-            "Чтобы выключить: /testmode off"
-        )
-
     elif data == "menu:admin":
         if user_id != ADMIN_ID:
             await query.answer("⛔ Нет доступа", show_alert=True)
             return
         await query.message.reply_text("🛠 Админ-панель", reply_markup=admin_main_keyboard())
-
-
-async def testmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not context.args:
-        await update.message.reply_text("Использование: /testmode КОД — или: /testmode off")
-        return
-
-    code = context.args[0]
-    if code.lower() == "off":
-        testing_mode_users.discard(user_id)
-        await update.message.reply_text("Тестовый режим выключен.")
-        return
-
-    if valid_test_code and code == valid_test_code:
-        testing_mode_users.add(user_id)
-        await update.message.reply_text(
-            "✅ Тестовый режим включён. После каждого ответа буду показывать токены, "
-            "время ответа, модель и нагрузку на сервер."
-        )
-    else:
-        await update.message.reply_text("❌ Неверный или устаревший код.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -301,21 +251,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await update.message.reply_text(reply)
 
-    if user_id in testing_mode_users:
-        usage = debug_info.get("usage") or {}
-        load = get_server_load()
-        debug_text = (
-            f"🧪 Тест-инфо\n"
-            f"Модель: {debug_info.get('model') or '—'}\n"
-            f"Время ответа: {debug_info.get('latency', 0):.2f} сек\n"
-            f"Токены — запрос: {usage.get('prompt_tokens', '?')}, "
-            f"ответ: {usage.get('completion_tokens', '?')}, "
-            f"всего: {usage.get('total_tokens', '?')}\n"
-            f"Нагрузка сервера — CPU: {load['cpu_percent']:.1f}%, "
-            f"память процесса: {load['memory_mb']:.1f} МБ"
-        )
-        await update.message.reply_text(debug_text)
-
 
 # ------------------------- Админ-панель -------------------------
 
@@ -326,7 +261,6 @@ def admin_main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📊 Статистика", callback_data="admin:stats")],
             [InlineKeyboardButton("👥 Чаты", callback_data="admin:chats")],
             [InlineKeyboardButton("📨 Рассылка всем", callback_data="admin:broadcast")],
-            [InlineKeyboardButton("🧪 Сгенерировать код теста", callback_data="admin:gen_testcode")],
             [InlineKeyboardButton(creator_label, callback_data="admin:toggle_creator")],
         ]
     )
@@ -447,4 +381,70 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "admin:toggle_creator":
         global creator_mode_enabled
         creator_mode_enabled = not creator_mode_enabled
-        await query.edit_message_
+        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_main_keyboard())
+
+
+async def post_init(application: Application) -> None:
+    default_commands = [
+        BotCommand("start", "Начать общение"),
+        BotCommand("menu", "Меню команд"),
+        BotCommand("clear", "Очистить историю чата"),
+    ]
+    await application.bot.set_my_commands(default_commands)
+
+    admin_commands = default_commands + [BotCommand("admin", "Админ-панель")]
+    try:
+        await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception as exc:
+        logger.warning(
+            "Не удалось установить меню команд для админа (возможно, админ ещё ни разу не писал боту): %s", exc
+        )
+
+
+def main() -> None:
+    # В Python 3.14 asyncio.get_event_loop() больше не создаёт цикл событий
+    # автоматически, если он не был явно установлен — а именно так делает
+    # внутренний код python-telegram-bot при запуске run_webhook/run_polling.
+    # Создаём и устанавливаем цикл вручную, чтобы это работало на любой
+    # версии Python, которую даст Render.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("clear", clear_history))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin:"))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("%s запущен, цепочка моделей: %s", BOT_NAME, ", ".join(OPENROUTER_MODELS))
+
+    # Render Free Web Service не поддерживает постоянный процесс с polling —
+    # вместо этого бот принимает обновления через webhook на порту, который
+    # даёт Render (переменная PORT), и адресу, который Render даёт сервису
+    # (переменная RENDER_EXTERNAL_URL — подставляется автоматически).
+    port = int(os.environ.get("PORT", "10000"))
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if external_url:
+        # Продакшн на Render: webhook-режим, бесплатный Web Service
+        url_path = TELEGRAM_BOT_TOKEN  # секретный путь, чтобы левые запросы не триггерили бота
+        webhook_url = f"{external_url}/{url_path}"
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        # Локальный запуск / отладка: обычный polling
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main_
