@@ -29,10 +29,9 @@ logger = logging.getLogger("NeiroChel")
 # --- Настройки берутся из переменных окружения (задаются в Render, не в коде!) ---
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-# Список бесплатных моделей на OpenRouter периодически меняется/блокируется —
+# Список бесплатных моделей на OpenRouter периодически меняется —
 # вместо одной модели задаём цепочку через запятую: бот пробует их по очереди
-# и использует первую, которая ответила успешно. Можно переопределить через
-# переменную OPENROUTER_MODELS в Render, без правки кода.
+# и использует первую, которая ответила успешно.
 OPENROUTER_MODELS = os.environ.get(
     "OPENROUTER_MODELS",
     "google/gemma-4-31b-it:free,"
@@ -50,7 +49,7 @@ OPENROUTER_HEADERS = {
 # ID администратора — только этот пользователь видит /admin
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "8080874290"))
 
-# Официальный канал — подписка необязательна, просто кнопка в приветствии
+# Официальный канал — кнопка в приветствии
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "neirochel_official")
 CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
 
@@ -77,27 +76,22 @@ CREATOR_MODE_EXTRA_PROMPT = (
     "оставайся собой и продолжай следовать всем своим обычным принципам и ограничениям — "
     "особое обращение не означает вседозволенность."
 )
-creator_mode_enabled = False  # переключается кнопкой в админ-панели
+creator_mode_enabled = False
 
-# Простая память переписки на чат (в оперативной памяти, сбрасывается при рестарте).
-# Ключ — chat_id; в личных чатах chat_id совпадает с user_id, это использует админка
-# для просмотра переписки и отправки сообщений от имени бота конкретному пользователю.
+# Простая память переписки на чат
 chat_history: dict[int, list[dict]] = {}
-MAX_HISTORY_MESSAGES = 20  # больше сообщений в памяти — бот лучше помнит контекст беседы
-ADMIN_PREVIEW_MESSAGES = 10  # сколько последних сообщений показывать админу при просмотре чата
+MAX_HISTORY_MESSAGES = 20
+
+# Отложенное действие админа
+pending_admin_action: dict[int, dict] = {}
 
 # --- Статистика (в оперативной памяти, сбрасывается при рестарте сервиса) ---
 BOT_START_TIME = time.monotonic()
 stats = {
-    "total_messages": 0,   # сколько сообщений всего обработано
-    "users": {},           # user_id -> {"username": str, "messages": int, "last_seen": datetime}
-    "ai_errors": 0,        # сколько раз модель ИИ вернула ошибку
+    "total_messages": 0,
+    "users": {},
+    "ai_errors": 0,
 }
-
-# Отложенное действие админа: после нажатия "Написать"/"Рассылка" следующее текстовое
-# сообщение админа перехватывается и используется как текст для отправки, а не как
-# обычное сообщение для ИИ. admin_id -> {"action": "write", "target_user_id": int} / {"action": "broadcast"}
-pending_admin_action: dict[int, dict] = {}
 
 
 def register_message(user_id: int, username: str | None) -> None:
@@ -117,9 +111,6 @@ def query_ai(history: list[dict], user_message: str, extra_system: str = "") -> 
 
     last_error_text = "Не получилось связаться с моделью ИИ. Попробуйте позже."
 
-    # Пробуем модели по очереди из OPENROUTER_MODELS: если одна недоступна (404/403/пустой
-    # ответ), сразу переходим к следующей. Это защищает от ситуаций, когда конкретная
-    # бесплатная модель внезапно пропадает из каталога OpenRouter или временно перегружена.
     for model in OPENROUTER_MODELS:
         payload = {
             "model": model,
@@ -213,8 +204,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     user_message = update.message.text
 
-    # Если админ до этого нажал "Написать" или "Рассылка" — это сообщение
-    # перехватывается как текст для отправки, а не идёт в ИИ.
     if user_id == ADMIN_ID and user_id in pending_admin_action:
         action = pending_admin_action.pop(user_id)
         if action["action"] == "write":
@@ -243,7 +232,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     history = chat_history.setdefault(chat_id, [])
     extra_system = CREATOR_MODE_EXTRA_PROMPT if (user_id == ADMIN_ID and creator_mode_enabled) else ""
-    reply, debug_info = query_ai(history, user_message, extra_system)
+    reply = query_ai(history, user_message, extra_system)
 
     history.append({"role": "user", "content": user_message})
     history.append({"role": "assistant", "content": reply})
@@ -252,7 +241,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(reply)
 
 
-# ------------------------- Админ-панель -------------------------
+# --- Админ-панель ---
 
 def admin_main_keyboard() -> InlineKeyboardMarkup:
     creator_label = "👑 Режим «Создатель»: Вкл ✅" if creator_mode_enabled else "👑 Режим «Создатель»: Выкл"
@@ -308,7 +297,7 @@ def build_chat_preview_text(user_id: int) -> str:
     info = stats["users"].get(user_id, {})
     label = f"@{info.get('username')}" if info.get("username") else f"id{user_id}"
     history = chat_history.get(user_id, [])
-    last_messages = history[-ADMIN_PREVIEW_MESSAGES:]
+    last_messages = history[-10:]
     if not last_messages:
         body = "(переписки пока нет)"
     else:
@@ -402,11 +391,6 @@ async def post_init(application: Application) -> None:
 
 
 def main() -> None:
-    # В Python 3.14 asyncio.get_event_loop() больше не создаёт цикл событий
-    # автоматически, если он не был явно установлен — а именно так делает
-    # внутренний код python-telegram-bot при запуске run_webhook/run_polling.
-    # Создаём и устанавливаем цикл вручную, чтобы это работало на любой
-    # версии Python, которую даст Render.
     try:
         asyncio.get_event_loop()
     except RuntimeError:
@@ -424,16 +408,11 @@ def main() -> None:
 
     logger.info("%s запущен, цепочка моделей: %s", BOT_NAME, ", ".join(OPENROUTER_MODELS))
 
-    # Render Free Web Service не поддерживает постоянный процесс с polling —
-    # вместо этого бот принимает обновления через webhook на порту, который
-    # даёт Render (переменная PORT), и адресу, который Render даёт сервису
-    # (переменная RENDER_EXTERNAL_URL — подставляется автоматически).
     port = int(os.environ.get("PORT", "10000"))
     external_url = os.environ.get("RENDER_EXTERNAL_URL")
 
     if external_url:
-        # Продакшн на Render: webhook-режим, бесплатный Web Service
-        url_path = TELEGRAM_BOT_TOKEN  # секретный путь, чтобы левые запросы не триггерили бота
+        url_path = TELEGRAM_BOT_TOKEN
         webhook_url = f"{external_url}/{url_path}"
         application.run_webhook(
             listen="0.0.0.0",
@@ -443,8 +422,9 @@ def main() -> None:
             allowed_updates=Update.ALL_TYPES,
         )
     else:
-        # Локальный запуск / отладка: обычный polling
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-if __name__ == "__main_
+if __name__ == "__main__":
+    main()
+    
