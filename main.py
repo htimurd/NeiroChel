@@ -4,7 +4,6 @@ import time
 import asyncio
 from datetime import datetime, timezone
 import requests
-import admin
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
@@ -60,13 +59,175 @@ SYSTEM_PROMPT = (
     f"или курсивный шрифт."
 )
 
-# --- Данные ---
+# =====================================================================
+# АДМИНКА: администраторы, права, тикеты техподдержки (всё в этом файле)
+# =====================================================================
+
+RIGHTS = ["view_stats", "broadcast", "manage_admins", "manage_tickets"]
+RIGHT_LABELS = {
+    "view_stats": "📊 Статистика",
+    "broadcast": "📨 Рассылка",
+    "manage_admins": "🛡 Управление админами",
+    "manage_tickets": "🎫 Тикеты",
+}
+
+# user_id -> {"name": str, "rights": [str, ...]}
+admins: dict[int, dict] = {}
+
+# ticket_id -> {"id", "user_id", "username", "status", "messages": [{"from","text"}]}
+tickets: dict[int, dict] = {}
+_next_ticket_id = 1
+
+
+def init_admin(main_admin_id: int) -> None:
+    """Инициализация главного администратора со всеми правами."""
+    global admins
+    admins = {main_admin_id: {"name": f"id{main_admin_id}", "rights": list(RIGHTS)}}
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in admins
+
+
+def has_right(user_id: int, right: str) -> bool:
+    return right in admins.get(user_id, {}).get("rights", [])
+
+
+def add_admin(user_id: int, name: str, rights: list[str] | None = None) -> bool:
+    if user_id in admins:
+        return False
+    admins[user_id] = {"name": name, "rights": rights or []}
+    return True
+
+
+def remove_admin(user_id: int, main_admin_id: int) -> bool:
+    if user_id == main_admin_id:
+        return False  # главного админа снять нельзя
+    if user_id in admins:
+        del admins[user_id]
+        return True
+    return False
+
+
+def toggle_right(user_id: int, right: str) -> None:
+    if user_id not in admins:
+        return
+    rights = admins[user_id]["rights"]
+    if right in rights:
+        rights.remove(right)
+    else:
+        rights.append(right)
+
+
+def create_ticket(user_id: int, username: str | None, message: str) -> int:
+    global _next_ticket_id
+    tid = _next_ticket_id
+    _next_ticket_id += 1
+    tickets[tid] = {
+        "id": tid,
+        "user_id": user_id,
+        "username": f"@{username}" if username else f"id{user_id}",
+        "status": "open",
+        "messages": [{"from": "user", "text": message}],
+    }
+    return tid
+
+
+def get_ticket(ticket_id: int) -> dict | None:
+    return tickets.get(ticket_id)
+
+
+def get_open_tickets() -> dict:
+    return {tid: t for tid, t in tickets.items() if t["status"] == "open"}
+
+
+def add_ticket_message(ticket_id: int, from_role: str, text: str) -> None:
+    if ticket_id in tickets:
+        tickets[ticket_id]["messages"].append({"from": from_role, "text": text})
+
+
+def close_ticket(ticket_id: int) -> bool:
+    if ticket_id in tickets:
+        tickets[ticket_id]["status"] = "closed"
+        return True
+    return False
+
+
+def admin_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    if has_right(user_id, "view_stats"):
+        rows.append([InlineKeyboardButton("📊 Статистика", callback_data="adm:stats")])
+    rows.append([InlineKeyboardButton("👤 Пользователи", callback_data="adm:users")])
+    if has_right(user_id, "manage_tickets"):
+        open_count = len(get_open_tickets())
+        label = f"🎫 Тикеты ({open_count})" if open_count else "🎫 Тикеты"
+        rows.append([InlineKeyboardButton(label, callback_data="adm:tickets")])
+    if has_right(user_id, "broadcast"):
+        rows.append([InlineKeyboardButton("📨 Рассылка", callback_data="adm:broadcast")])
+    if has_right(user_id, "manage_admins"):
+        rows.append([InlineKeyboardButton("🛡 Управление админами", callback_data="adm:manage_admins")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admins_list_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(info["name"], callback_data=f"adm:admin_detail:{uid}")] for uid, info in admins.items()]
+    rows.append([InlineKeyboardButton("➕ Добавить админа", callback_data="adm:add_admin")])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_detail_keyboard(uid: int, main_admin_id: int) -> InlineKeyboardMarkup:
+    info = admins.get(uid, {"rights": []})
+    rows = []
+    for right in RIGHTS:
+        mark = "✅" if right in info["rights"] else "◻️"
+        rows.append([InlineKeyboardButton(f"{mark} {RIGHT_LABELS[right]}", callback_data=f"adm:toggle_right:{uid}:{right}")])
+    if uid != main_admin_id:
+        rows.append([InlineKeyboardButton("🗑 Снять администратора", callback_data=f"adm:remove_admin:{uid}")])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="adm:manage_admins")])
+    return InlineKeyboardMarkup(rows)
+
+
+def tickets_list_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(f"🎫 #{tid} — {t['username']}", callback_data=f"adm:ticket:{tid}")]
+        for tid, t in get_open_tickets().items()
+    ]
+    if not rows:
+        rows.append([InlineKeyboardButton("(открытых тикетов нет)", callback_data="adm:main")])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def ticket_detail_text(ticket_id: int) -> str:
+    t = tickets.get(ticket_id)
+    if not t:
+        return "Тикет не найден."
+    lines = [f"🎫 Тикет #{ticket_id} — {t['username']} (статус: {t['status']})", ""]
+    for m in t["messages"]:
+        who = "Пользователь" if m["from"] == "user" else "Админ"
+        lines.append(f"{who}: {m['text']}")
+    return "\n".join(lines)
+
+
+def ticket_detail_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
+    t = tickets.get(ticket_id)
+    rows = [[InlineKeyboardButton("📝 Ответить", callback_data=f"adm:ticket_reply:{ticket_id}")]]
+    if t and t["status"] == "open":
+        rows.append([InlineKeyboardButton("✅ Закрыть тикет", callback_data=f"adm:ticket_close:{ticket_id}")])
+    rows.append([InlineKeyboardButton("🔙 К тикетам", callback_data="adm:tickets")])
+    return InlineKeyboardMarkup(rows)
+
+
+# =====================================================================
+# ОСНОВНОЙ БОТ
+# =====================================================================
+
 chat_history: dict[int, list[dict]] = {}
 MAX_HISTORY_MESSAGES = 20
 
-# Отложенное действие пользователя/админа: следующее текстовое сообщение будет
-# перехвачено и обработано особым образом (а не как обычное сообщение к ИИ).
-# user_id -> {"action": str, ...доп. данные}
+# Отложенное действие: следующее текстовое сообщение будет перехвачено
+# и обработано особым образом (а не как обычное сообщение к ИИ).
 pending_action: dict[int, dict] = {}
 
 BOT_START_TIME = time.monotonic()
@@ -128,15 +289,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, reply_markup=keyboard)
 
 
-# --- Меню ---
-
 def build_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🧹 Очистить память бота", callback_data="menu:clear")],
         [InlineKeyboardButton("💬 Написать другому пользователю", callback_data="menu:send_msg")],
         [InlineKeyboardButton("🆘 Техподдержка", callback_data="menu:support")],
     ]
-    if admin.is_admin(user_id):
+    if is_admin(user_id):
         rows.append([InlineKeyboardButton("🛠 Админ-панель", callback_data="menu:admin")])
     return InlineKeyboardMarkup(rows)
 
@@ -172,17 +331,15 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
     elif data == "menu:admin":
-        if not admin.is_admin(user_id):
+        if not is_admin(user_id):
             await query.answer("⛔ Нет доступа", show_alert=True)
             return
-        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin.admin_main_keyboard(user_id))
+        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_main_keyboard(user_id))
 
     elif data == "menu:cancel":
         pending_action.pop(user_id, None)
         await query.edit_message_text("Действие отменено.")
 
-
-# --- Обработка обычных сообщений и отложенных действий ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -212,10 +369,10 @@ async def handle_pending_action(update, context, user_id, username, action, text
     kind = action["action"]
 
     if kind == "support_ticket":
-        ticket_id = admin.create_ticket(user_id, username, text)
+        ticket_id = create_ticket(user_id, username, text)
         await update.message.reply_text(f"✅ Тикет #{ticket_id} создан. Мы ответим вам прямо в этом чате.")
-        for admin_id, info in admin.admins.items():
-            if not admin.has_right(admin_id, "manage_tickets"):
+        for admin_id in admins:
+            if not has_right(admin_id, "manage_tickets"):
                 continue
             try:
                 await context.bot.send_message(
@@ -240,7 +397,7 @@ async def handle_pending_action(update, context, user_id, username, action, text
             await update.message.reply_text("❌ ID должен быть числом. Попробуйте ещё раз через меню.")
             return
         try:
-            sent = await context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=target_id,
                 text=f"📬 Сообщение от {user_label(user_id, username)}:\n\n{text}",
                 reply_markup=InlineKeyboardMarkup(
@@ -263,7 +420,7 @@ async def handle_pending_action(update, context, user_id, username, action, text
         except ValueError:
             await update.message.reply_text("❌ ID должен быть числом.")
             return
-        added = admin.add_admin(new_admin_id, f"id{new_admin_id}", rights=[])
+        added = add_admin(new_admin_id, f"id{new_admin_id}", rights=[])
         if added:
             await update.message.reply_text(
                 f"✅ Пользователь id{new_admin_id} добавлен в администраторы (без прав — настройте их в списке админов)."
@@ -283,11 +440,11 @@ async def handle_pending_action(update, context, user_id, username, action, text
 
     elif kind == "ticket_reply":
         ticket_id = action["ticket_id"]
-        ticket = admin.get_ticket(ticket_id)
+        ticket = get_ticket(ticket_id)
         if not ticket:
             await update.message.reply_text("Тикет не найден (возможно, был закрыт).")
             return
-        admin.add_ticket_message(ticket_id, "admin", text)
+        add_ticket_message(ticket_id, "admin", text)
         try:
             await context.bot.send_message(
                 chat_id=ticket["user_id"],
@@ -313,14 +470,12 @@ async def pm_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.message.delete()
 
 
-# --- Админ-панель ---
-
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    if not admin.is_admin(user_id):
+    if not is_admin(user_id):
         await update.message.reply_text("⛔ У вас нет доступа к этой команде.")
         return
-    await update.message.reply_text("🛠 Админ-панель", reply_markup=admin.admin_main_keyboard(user_id))
+    await update.message.reply_text("🛠 Админ-панель", reply_markup=admin_main_keyboard(user_id))
 
 
 def build_stats_text() -> str:
@@ -337,131 +492,11 @@ def build_stats_text() -> str:
         f"💬 Сообщений обработано: {stats['total_messages']}\n"
         f"⚠️ Ошибок ИИ: {stats['ai_errors']}\n"
         f"⏱ Аптайм: {hours}ч {minutes}м {seconds}с\n"
-        f"🎫 Открытых тикетов: {len(admin.get_open_tickets())}\n\n"
+        f"🎫 Открытых тикетов: {len(get_open_tickets())}\n\n"
         f"🏆 Топ активных:\n{top_text}"
     )
 
 
 def build_users_keyboard() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(user_label(uid, info["username"]), callback_data=f"adm:user:{uid}")]
-        for uid, info in stats["users"].items()
-    ]
-    if not rows:
-        rows.append([InlineKeyboardButton("(пока нет пользователей)", callback_data="adm:main")])
-    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="adm:main")])
-    return InlineKeyboardMarkup(rows)
-
-
-def build_user_preview_text(user_id: int) -> str:
-    info = stats["users"].get(user_id, {})
-    label = user_label(user_id, info.get("username"))
-    history = chat_history.get(user_id, [])[-10:]
-    if not history:
-        body = "(переписки с ИИ пока нет)"
-    else:
-        body = "\n".join(f"{'Пользователь' if m['role'] == 'user' else 'Бот'}: {m['content']}" for m in history)
-    return f"💬 {label}\n\n{body}"
-
-
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user_id = query.from_user.id
-    if not admin.is_admin(user_id):
-        await query.answer("⛔ Нет доступа", show_alert=True)
-        return
-
-    data = query.data
-    await query.answer()
-
-    if data == "adm:main":
-        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin.admin_main_keyboard(user_id))
-
-    elif data == "adm:stats":
-        if not admin.has_right(user_id, "view_stats"):
-            await query.answer("⛔ Нет прав", show_alert=True)
-            return
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="adm:main")]])
-        await query.edit_message_text(build_stats_text(), reply_markup=keyboard)
-
-    elif data == "adm:users":
-        await query.edit_message_text("👤 Пользователи:", reply_markup=build_users_keyboard())
-
-    elif data.startswith("adm:user:"):
-        target_id = int(data.split(":")[2])
-        keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("✍️ Написать от имени бота", callback_data=f"adm:write:{target_id}")],
-                [InlineKeyboardButton("🔙 К списку", callback_data="adm:users")],
-            ]
-        )
-        await query.edit_message_text(build_user_preview_text(target_id), reply_markup=keyboard)
-
-    elif data.startswith("adm:write:"):
-        target_id = int(data.split(":")[2])
-        pending_action[user_id] = {"action": "send_msg_text", "target_id": str(target_id)}
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
-        await query.edit_message_text(f"✍️ Напишите сообщение — уйдёт пользователю id{target_id} от имени бота:", reply_markup=keyboard)
-
-    elif data == "adm:broadcast":
-        if not admin.has_right(user_id, "broadcast"):
-            await query.answer("⛔ Нет прав", show_alert=True)
-            return
-        pending_action[user_id] = {"action": "admin_broadcast"}
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
-        await query.edit_message_text("📨 Напишите текст рассылки для всех пользователей:", reply_markup=keyboard)
-
-    # --- Тикеты ---
-    elif data == "adm:tickets":
-        if not admin.has_right(user_id, "manage_tickets"):
-            await query.answer("⛔ Нет прав", show_alert=True)
-            return
-        await query.edit_message_text("🎫 Открытые тикеты:", reply_markup=admin.tickets_list_keyboard())
-
-    elif data.startswith("adm:ticket:"):
-        ticket_id = int(data.split(":")[2])
-        await query.edit_message_text(admin.ticket_detail_text(ticket_id), reply_markup=admin.ticket_detail_keyboard(ticket_id))
-
-    elif data.startswith("adm:ticket_reply:"):
-        ticket_id = int(data.split(":")[2])
-        if not admin.has_right(user_id, "manage_tickets"):
-            await query.answer("⛔ Нет прав", show_alert=True)
-            return
-        pending_action[user_id] = {"action": "ticket_reply", "ticket_id": ticket_id}
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
-        await query.message.reply_text(f"Напишите ответ по тикету #{ticket_id}:", reply_markup=keyboard)
-
-    elif data.startswith("adm:ticket_close:"):
-        ticket_id = int(data.split(":")[2])
-        admin.close_ticket(ticket_id)
-        ticket = admin.get_ticket(ticket_id)
-        if ticket:
-            try:
-                await context.bot.send_message(chat_id=ticket["user_id"], text=f"✅ Тикет #{ticket_id} закрыт администратором.")
-            except Exception:
-                pass
-        await query.edit_message_text("🎫 Открытые тикеты:", reply_markup=admin.tickets_list_keyboard())
-
-    # --- Управление админами ---
-    elif data == "adm:manage_admins":
-        if not admin.has_right(user_id, "manage_admins"):
-            await query.answer("⛔ Нет прав", show_alert=True)
-            return
-        await query.edit_message_text("🛡 Администраторы:", reply_markup=admin.admins_list_keyboard())
-
-    elif data == "adm:add_admin":
-        if not admin.has_right(user_id, "manage_admins"):
-            await query.answer("⛔ Нет прав", show_alert=True)
-            return
-        pending_action[user_id] = {"action": "admin_add_id"}
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
-        await query.edit_message_text("Введите числовой Telegram ID нового администратора:", reply_markup=keyboard)
-
-    elif data.startswith("adm:admin_detail:"):
-        target_id = int(data.split(":")[2])
-        await query.edit_message_text(
-            f"🛡 Администратор: {admin.admins.get(target_id, {}).get('name', target_id)}\n\nПрава (нажмите, чтобы переключить):",
-            reply_markup=admin.admin_detail_keyboard(target_id, MAIN_ADMIN_ID),
-        )
-
-    elif data.star
+        [InlineKeyboardButton(user_lab
