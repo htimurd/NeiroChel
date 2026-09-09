@@ -499,4 +499,197 @@ def build_stats_text() -> str:
 
 def build_users_keyboard() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(user_lab
+        [InlineKeyboardButton(user_label(uid, info["username"]), callback_data=f"adm:user:{uid}")]
+        for uid, info in stats["users"].items()
+    ]
+    if not rows:
+        rows.append([InlineKeyboardButton("(пока нет пользователей)", callback_data="adm:main")])
+    rows.append([InlineKeyboardButton("🔙 Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_user_preview_text(user_id: int) -> str:
+    info = stats["users"].get(user_id, {})
+    label = user_label(user_id, info.get("username"))
+    history = chat_history.get(user_id, [])[-10:]
+    if not history:
+        body = "(переписки с ИИ пока нет)"
+    else:
+        body = "\n".join(f"{'Пользователь' if m['role'] == 'user' else 'Бот'}: {m['content']}" for m in history)
+    return f"💬 {label}\n\n{body}"
+
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        await query.answer("⛔ Нет доступа", show_alert=True)
+        return
+
+    data = query.data
+    await query.answer()
+
+    if data == "adm:main":
+        await query.edit_message_text("🛠 Админ-панель", reply_markup=admin_main_keyboard(user_id))
+
+    elif data == "adm:stats":
+        if not has_right(user_id, "view_stats"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="adm:main")]])
+        await query.edit_message_text(build_stats_text(), reply_markup=keyboard)
+
+    elif data == "adm:users":
+        await query.edit_message_text("👤 Пользователи:", reply_markup=build_users_keyboard())
+
+    elif data.startswith("adm:user:"):
+        target_id = int(data.split(":")[2])
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✍️ Написать от имени бота", callback_data=f"adm:write:{target_id}")],
+                [InlineKeyboardButton("🔙 К списку", callback_data="adm:users")],
+            ]
+        )
+        await query.edit_message_text(build_user_preview_text(target_id), reply_markup=keyboard)
+
+    elif data.startswith("adm:write:"):
+        target_id = int(data.split(":")[2])
+        pending_action[user_id] = {"action": "send_msg_text", "target_id": str(target_id)}
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
+        await query.edit_message_text(f"✍️ Напишите сообщение — уйдёт пользователю id{target_id} от имени бота:", reply_markup=keyboard)
+
+    elif data == "adm:broadcast":
+        if not has_right(user_id, "broadcast"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        pending_action[user_id] = {"action": "admin_broadcast"}
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
+        await query.edit_message_text("📨 Напишите текст рассылки для всех пользователей:", reply_markup=keyboard)
+
+    elif data == "adm:tickets":
+        if not has_right(user_id, "manage_tickets"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        await query.edit_message_text("🎫 Открытые тикеты:", reply_markup=tickets_list_keyboard())
+
+    elif data.startswith("adm:ticket:"):
+        ticket_id = int(data.split(":")[2])
+        await query.edit_message_text(ticket_detail_text(ticket_id), reply_markup=ticket_detail_keyboard(ticket_id))
+
+    elif data.startswith("adm:ticket_reply:"):
+        ticket_id = int(data.split(":")[2])
+        if not has_right(user_id, "manage_tickets"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        pending_action[user_id] = {"action": "ticket_reply", "ticket_id": ticket_id}
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
+        await query.message.reply_text(f"Напишите ответ по тикету #{ticket_id}:", reply_markup=keyboard)
+
+    elif data.startswith("adm:ticket_close:"):
+        ticket_id = int(data.split(":")[2])
+        close_ticket(ticket_id)
+        ticket = get_ticket(ticket_id)
+        if ticket:
+            try:
+                await context.bot.send_message(chat_id=ticket["user_id"], text=f"✅ Тикет #{ticket_id} закрыт администратором.")
+            except Exception:
+                pass
+        await query.edit_message_text("🎫 Открытые тикеты:", reply_markup=tickets_list_keyboard())
+
+    elif data == "adm:manage_admins":
+        if not has_right(user_id, "manage_admins"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        await query.edit_message_text("🛡 Администраторы:", reply_markup=admins_list_keyboard())
+
+    elif data == "adm:add_admin":
+        if not has_right(user_id, "manage_admins"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        pending_action[user_id] = {"action": "admin_add_id"}
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:cancel")]])
+        await query.edit_message_text("Введите числовой Telegram ID нового администратора:", reply_markup=keyboard)
+
+    elif data.startswith("adm:admin_detail:"):
+        target_id = int(data.split(":")[2])
+        await query.edit_message_text(
+            f"🛡 Администратор: {admins.get(target_id, {}).get('name', target_id)}\n\nПрава (нажмите, чтобы переключить):",
+            reply_markup=admin_detail_keyboard(target_id, MAIN_ADMIN_ID),
+        )
+
+    elif data.startswith("adm:toggle_right:"):
+        if not has_right(user_id, "manage_admins"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        _, _, target_id_s, right = data.split(":")
+        target_id = int(target_id_s)
+        toggle_right(target_id, right)
+        await query.edit_message_text(
+            f"🛡 Администратор: {admins.get(target_id, {}).get('name', target_id)}\n\nПрава (нажмите, чтобы переключить):",
+            reply_markup=admin_detail_keyboard(target_id, MAIN_ADMIN_ID),
+        )
+
+    elif data.startswith("adm:remove_admin:"):
+        if not has_right(user_id, "manage_admins"):
+            await query.answer("⛔ Нет прав", show_alert=True)
+            return
+        target_id = int(data.split(":")[2])
+        removed = remove_admin(target_id, MAIN_ADMIN_ID)
+        if not removed:
+            await query.answer("Нельзя снять главного администратора", show_alert=True)
+        await query.edit_message_text("🛡 Администраторы:", reply_markup=admins_list_keyboard())
+
+
+async def post_init(application: Application) -> None:
+    init_admin(MAIN_ADMIN_ID)
+    default_commands = [
+        BotCommand("start", "Начать общение"),
+        BotCommand("menu", "Меню"),
+    ]
+    await application.bot.set_my_commands(default_commands)
+
+    admin_commands = default_commands + [BotCommand("admin", "Админ-панель")]
+    try:
+        await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=MAIN_ADMIN_ID))
+    except Exception as exc:
+        logger.warning("Не удалось установить меню команд для админа: %s", exc)
+
+
+def main() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CallbackQueryHandler(admin_callback, pattern="^adm:"))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
+    application.add_handler(CallbackQueryHandler(pm_button_callback, pattern="^pm_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logger.info("%s запущен, цепочка моделей: %s", BOT_NAME, ", ".join(OPENROUTER_MODELS))
+
+    port = int(os.environ.get("PORT", "10000"))
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if external_url:
+        url_path = TELEGRAM_BOT_TOKEN
+        webhook_url = f"{external_url}/{url_path}"
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+                
