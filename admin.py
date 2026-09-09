@@ -82,4 +82,4 @@ def admin_main_keyboard(main_admin_id: int) -> InlineKeyboardMarkup:
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, main_admin_id: int) -> None:
     """Показать главное меню админки"""
     await update.message.reply_text("🛠 Админ-панель", reply_markup=admin_main_keyboard(main_admin_id))
-  
+    
