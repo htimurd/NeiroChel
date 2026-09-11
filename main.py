@@ -341,16 +341,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.edit_message_text("Действие отменено.")
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def process_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str) -> None:
     user_id = update.effective_user.id
     username = update.effective_user.username
     chat_id = update.effective_chat.id
-    user_message = update.message.text
-
-    if user_id in pending_action:
-        action = pending_action.pop(user_id)
-        await handle_pending_action(update, context, user_id, username, action, user_message)
-        return
 
     register_message(user_id, username)
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -363,6 +357,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_history[chat_id] = history[-MAX_HISTORY_MESSAGES:]
 
     await update.message.reply_text(reply)
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    question = " ".join(context.args) if context.args else ""
+    if not question:
+        await update.message.reply_text("Использование: /ask ваш вопрос")
+        return
+    await process_ai_question(update, context, question)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    user_message = update.message.text
+
+    if user_id in pending_action:
+        action = pending_action.pop(user_id)
+        await handle_pending_action(update, context, user_id, username, action, user_message)
+        return
+
+    # В группах/каналах бот не отвечает на каждое сообщение — только на /ask.
+    # В личных чатах с ботом работает как обычно.
+    if update.effective_chat.type != "private":
+        return
+
+    await process_ai_question(update, context, user_message)
 
 
 async def handle_pending_action(update, context, user_id, username, action, text) -> None:
@@ -645,6 +665,7 @@ async def post_init(application: Application) -> None:
     default_commands = [
         BotCommand("start", "Начать общение"),
         BotCommand("menu", "Меню"),
+        BotCommand("ask", "Задать вопрос боту (для групп)"),
     ]
     await application.bot.set_my_commands(default_commands)
 
@@ -665,6 +686,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CallbackQueryHandler(admin_callback, pattern="^adm:"))
     application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu:"))
@@ -692,4 +714,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-                
+    
